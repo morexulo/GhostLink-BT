@@ -26,6 +26,96 @@ from .image_handler import load_image_bytes, compress_image, validate_image_file
 
 logger = setup_logger("ui")
 
+# --- Bluetooth Helpers ---
+def get_local_bt_mac():
+    """Get local Bluetooth adapter MAC address. Tries multiple methods for Win10/11 compatibility."""
+    
+    # Method 1: Get-NetAdapter (works well on Win11)
+    try:
+        result = subprocess.run(
+            ['powershell', '-NoProfile', '-Command',
+             "Get-NetAdapter | Where-Object {$_.InterfaceDescription -like '*Bluetooth*'} | Select-Object -ExpandProperty MacAddress"],
+            capture_output=True, text=True, timeout=5,
+            creationflags=subprocess.CREATE_NO_WINDOW
+        )
+        mac = result.stdout.strip().split('\n')[0].strip()
+        if mac and len(mac) >= 12 and mac != '':
+            return mac.replace('-', ':')
+    except Exception:
+        pass
+    
+    # Method 2: Read from Windows Registry (works on Win10/11)
+    try:
+        result = subprocess.run(
+            ['powershell', '-NoProfile', '-Command',
+             r"Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Services\BTHPORT\Parameters\' -Name 'LocalAddr' -ErrorAction SilentlyContinue | Select-Object -ExpandProperty LocalAddr"],
+            capture_output=True, text=True, timeout=5,
+            creationflags=subprocess.CREATE_NO_WINDOW
+        )
+        raw = result.stdout.strip()
+        if raw:
+            # Registry returns space-separated bytes like "0 17 34 51 68 85" or similar
+            parts = raw.split()
+            if len(parts) >= 6:
+                mac = ':'.join(f'{int(b):02X}' for b in parts[:6])
+                return mac
+    except Exception:
+        pass
+    
+    # Method 3: PnP Device ID parsing (broad compatibility)
+    try:
+        result = subprocess.run(
+            ['powershell', '-NoProfile', '-Command',
+             "Get-PnpDevice -Class Bluetooth -ErrorAction SilentlyContinue | Where-Object {$_.FriendlyName -like '*Radio*' -or $_.FriendlyName -like '*Adapter*' -or $_.FriendlyName -like '*Bluetooth*'} | Select-Object -First 1 -ExpandProperty InstanceId"],
+            capture_output=True, text=True, timeout=5,
+            creationflags=subprocess.CREATE_NO_WINDOW
+        )
+        instance_id = result.stdout.strip()
+        if instance_id and '_' in instance_id:
+            # InstanceId format: BTHENUM\{...}_VID&..._AABBCCDDEEFF
+            # or USB\VID_...\5&AABBCCDDEEFF
+            # Extract last 12 hex chars
+            import re
+            hex_match = re.findall(r'([0-9A-Fa-f]{12})', instance_id)
+            if hex_match:
+                raw = hex_match[-1]
+                mac = ':'.join(raw[i:i+2].upper() for i in range(0, 12, 2))
+                return mac
+    except Exception:
+        pass
+    
+    logger.warning("Could not detect local BT MAC with any method.")
+    return "NOT_DETECTED"
+
+
+def get_paired_devices():
+    """Get list of paired Bluetooth devices from Windows registry.
+    Returns list of (name, mac) tuples."""
+    devices = []
+    try:
+        # Get paired device MACs from registry
+        result = subprocess.run(
+            ['powershell', '-NoProfile', '-Command',
+             r"Get-ChildItem 'HKLM:\SYSTEM\CurrentControlSet\Services\BTHPORT\Parameters\Devices' -ErrorAction SilentlyContinue | ForEach-Object { $mac = $_.PSChildName; $name = (Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue).'FriendlyName'; if ($name) { Write-Output \"$name||$mac\" } }"],
+            capture_output=True, text=True, timeout=10,
+            creationflags=subprocess.CREATE_NO_WINDOW
+        )
+        for line in result.stdout.strip().split('\n'):
+            line = line.strip()
+            if '||' in line:
+                parts = line.split('||', 1)
+                name = parts[0].strip()
+                raw_mac = parts[1].strip()
+                # Format MAC: 001122334455 -> 00:11:22:33:44:55
+                if len(raw_mac) == 12:
+                    mac = ':'.join(raw_mac[i:i+2] for i in range(0, 12, 2))
+                else:
+                    mac = raw_mac
+                devices.append((name, mac))
+    except Exception as e:
+        logger.warning(f"Could not scan paired devices: {e}")
+    return devices
+
 # --- Styles ---
 # Tactical Stealth Theme (GhostLink)
 TACTICAL_STYLESHEET = """
@@ -257,9 +347,20 @@ class ChatWindow(QMainWindow):
         info_frame.setStyleSheet("background-color: #0f1115; font-size: 11px; color: #546e7a; border-bottom: 1px solid #1a1f24;")
         info_layout = QHBoxLayout(info_frame)
         info_layout.setContentsMargins(10, 2, 10, 2)
-        # Try to get MAC (Python logic for this is flaky on Windows without heavy libs, 
-        # showing PC Name is often better)
-        info_layout.addWidget(QLabel(f"DEVICE_ID: {PC_NAME.upper()}"))
+        
+        # Detect local BT MAC
+        self.local_mac = get_local_bt_mac()
+        mac_label = QLabel(f"DEVICE: {PC_NAME.upper()}  |  MAC: {self.local_mac}")
+        mac_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        mac_label.setCursor(Qt.IBeamCursor)
+        info_layout.addWidget(mac_label)
+        info_layout.addStretch()
+        
+        self.btn_scan = QPushButton("[ SCAN_DEVICES ]")
+        self.btn_scan.setStyleSheet("font-size: 10px; padding: 2px 8px;")
+        self.btn_scan.clicked.connect(self.scan_devices)
+        info_layout.addWidget(self.btn_scan)
+        
         main_layout.addWidget(info_frame)
 
         # --- Chat Area ---
@@ -307,8 +408,6 @@ class ChatWindow(QMainWindow):
         
         main_layout.addWidget(input_frame)
         
-        main_layout.addWidget(input_frame)
-        
         # --- Footer ---
         footer_lbl = QLabel("@jaimemorenoo1 || CODE: GHOST_PROTOCOL_V1 || jaicarmods@gmail.com || Stellaris Code")
         footer_lbl.setAlignment(Qt.AlignCenter)
@@ -318,15 +417,75 @@ class ChatWindow(QMainWindow):
         # --- Drag & Drop ---
         self.setAcceptDrops(True)
 
+    # --- Scan Logic ---
+    def scan_devices(self):
+        """Scan and display paired Bluetooth devices."""
+        self.add_system_message("SCANNING BT DEVICES...")
+        devices = get_paired_devices()
+        
+        if not devices:
+            self.add_system_message("NO PAIRED DEVICES FOUND. Pair devices in Windows Bluetooth Settings first.")
+            return
+        
+        self.add_system_message(f"FOUND {len(devices)} PAIRED DEVICE(S):")
+        for name, mac in devices:
+            self.add_system_message(f"  > {name}  [{mac}]")
+
     # --- Start Logic ---
     def start_server(self):
         self._start_bt('server')
         
     def start_client_dialog(self):
-        from PySide6.QtWidgets import QInputDialog
-        text, ok = QInputDialog.getText(self, 'Connect to Host', 'Enter Host MAC Address (e.g. 11:22:33:44:55:66):')
-        if ok and text:
-            self._start_bt('client', text)
+        """Show device picker or manual MAC input."""
+        devices = get_paired_devices()
+        
+        if devices:
+            # Build selection list
+            from PySide6.QtWidgets import QDialog, QDialogButtonBox
+            
+            dialog = QDialog(self)
+            dialog.setWindowTitle("SELECT_TARGET")
+            dialog.setStyleSheet(self.styleSheet())
+            dialog.resize(450, 350)
+            
+            dlg_layout = QVBoxLayout(dialog)
+            
+            dlg_layout.addWidget(QLabel("DETECTED PAIRED DEVICES:"))
+            
+            device_list = QListWidget()
+            device_list.setStyleSheet("QListWidget { background-color: #14171b; border: 1px solid #263238; }")
+            for name, mac in devices:
+                item = QListWidgetItem(f"{name}  [{mac}]")
+                item.setData(Qt.UserRole, mac)
+                device_list.addItem(item)
+            dlg_layout.addWidget(device_list)
+            
+            dlg_layout.addWidget(QLabel("— OR ENTER MAC MANUALLY —"))
+            manual_input = QLineEdit()
+            manual_input.setPlaceholderText("00:11:22:33:44:55")
+            dlg_layout.addWidget(manual_input)
+            
+            btn_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+            btn_box.accepted.connect(dialog.accept)
+            btn_box.rejected.connect(dialog.reject)
+            dlg_layout.addWidget(btn_box)
+            
+            if dialog.exec() == QDialog.Accepted:
+                # Priority: selected device > manual input
+                selected = device_list.currentItem()
+                if selected:
+                    mac = selected.data(Qt.UserRole)
+                else:
+                    mac = manual_input.text().strip()
+                
+                if mac:
+                    self._start_bt('client', mac)
+        else:
+            # Fallback: simple manual input
+            from PySide6.QtWidgets import QInputDialog
+            text, ok = QInputDialog.getText(self, 'TARGET_MAC', 'No paired devices found.\nEnter Host MAC Address (e.g. 00:11:22:33:44:55):')
+            if ok and text:
+                self._start_bt('client', text)
 
     def _start_bt(self, mode, target_address=None):
         self.btn_server.setEnabled(False)
@@ -476,7 +635,9 @@ class ChatWindow(QMainWindow):
                 text = "<Binary Data>"
             lbl = QLabel(text)
             lbl.setWordWrap(True)
-            lbl.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            lbl.setTextInteractionFlags(Qt.TextSelectableByMouse | Qt.TextSelectableByKeyboard)
+            lbl.setCursor(Qt.IBeamCursor)
+            lbl.setStyleSheet(f"color: {text_color};")
             bubble_layout.addWidget(lbl)
         elif msg_type == MSG_TYPE_IMAGE:
              # Render Image
@@ -508,11 +669,22 @@ class ChatWindow(QMainWindow):
         self.chat_list.scrollToBottom()
 
     def add_system_message(self, text):
-        item = QListWidgetItem(f">> SYSTEM: {text}")
-        item.setTextAlignment(Qt.AlignCenter)
-        item.setForeground(QColor("#546e7a"))
-        item.setFont(QFont("Consolas", 10))
+        item_widget = QWidget()
+        layout = QHBoxLayout(item_widget)
+        layout.setContentsMargins(20, 2, 20, 2)
+        
+        lbl = QLabel(f">> SYSTEM: {text}")
+        lbl.setAlignment(Qt.AlignCenter)
+        lbl.setStyleSheet("color: #546e7a; font-family: 'Consolas'; font-size: 10px;")
+        lbl.setTextInteractionFlags(Qt.TextSelectableByMouse | Qt.TextSelectableByKeyboard)
+        lbl.setCursor(Qt.IBeamCursor)
+        lbl.setWordWrap(True)
+        layout.addWidget(lbl)
+        
+        item = QListWidgetItem(self.chat_list)
+        item.setSizeHint(item_widget.sizeHint())
         self.chat_list.addItem(item)
+        self.chat_list.setItemWidget(item, item_widget)
         self.chat_list.scrollToBottom()
 
     # --- Drag & Drop ---

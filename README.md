@@ -71,12 +71,20 @@ _GhostLink BT bridges both worlds without breaking the air-gap isolation._
 
 ## 🚀 Installation & Usage
 
+### ⚠️ IMPORTANT: First Step (Crucial)
+
+For the encrypted link to work, **you must pair both computers** via Windows Bluetooth settings first:
+
+1.  Go to `Settings > Bluetooth & devices` on both PCs.
+2.  Click `Add device` and pair **PC A** with **PC B**.
+3.  Ensure Bluetooth is turned **ON** and both devices are **Discoverable**.
+
 ### Option A: Portable Executable (Recommended)
 
-1.  Download `GhostLinkBT.exe` from the Releases page (or `dist/` folder).
+1.  Download `GhostLinkBT.exe` from the `dist/` folder.
 2.  Launch it on **PC A** (Host) and **PC B** (Client).
 3.  On **PC A**, click **[ HOST SESSION ]**.
-4.  On **PC B**, click **[ JOIN SESSION ]** and enter the MAC Address of the host machine.
+4.  On **PC B**, click **[ JOIN SESSION ]**, select your paired PC from the list (or enter the MAC Address manually).
 
 ### Option B: Running from Source
 
@@ -113,4 +121,5 @@ To generate the standalone `.exe` yourself:
 ---
 
 **Developed by @jaimemorenoo1** // _Stellaris Code // Ghost Protocol V1_
+
 # GhostLink-BT

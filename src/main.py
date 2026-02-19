@@ -49,10 +49,10 @@ def run_client(target_address=None):
             msg = input()
             if msg == '/quit':
                 break
-            if client.connected:
+            if client.client_sock:
                 client.send_message(MSG_TYPE_TEXT, msg.encode('utf-8'))
             else:
-                logger.warning("Not connected. Cannot send.")
+                logger.warning("Not connected. Waiting for uplink...")
     except KeyboardInterrupt:
         pass
     finally:
